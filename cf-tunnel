@@ -14,33 +14,62 @@
 #    sudo cf-tunnel add app.thaonv.online http://localhost:8080
 #    sudo cf-tunnel add nas.thaonv.online http://127.0.0.1:9000
 # ------------------------------------------------------------
-set -uo pipefail
+set -Eeuo pipefail
+
+VERSION="1.1.0"
 
 ENV_FILE=/etc/cloudflared/cf-api.env
 STATE=/etc/cloudflared/tunnel-id
 API=https://api.cloudflare.com/client/v4
 
-[ "$(id -u)" -eq 0 ] || { echo "Cần chạy bằng sudo."; exit 1; }
-[ -r "$ENV_FILE" ] || { echo "Không tìm thấy $ENV_FILE"; exit 1; }
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-
 die() { printf '\033[1;31mLỗi:\033[0m %s\n' "$*" >&2; exit 1; }
 ok()  { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "Cần chạy bằng sudo."
+}
+
+require_commands() {
+    local command_name
+    for command_name in curl jq systemctl; do
+        command -v "$command_name" >/dev/null 2>&1 || die "Thiếu dependency: $command_name"
+    done
+}
+
+valid_hostname() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+valid_service() {
+    [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]+$ || "$1" == http_status:* ]]
+}
+
+load_config() {
+    require_root
+    [ -r "$ENV_FILE" ] || die "Không tìm thấy $ENV_FILE"
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    : "${CF_API_TOKEN:?Thiếu CF_API_TOKEN trong $ENV_FILE}"
+    : "${CF_ACCOUNT_ID:?Thiếu CF_ACCOUNT_ID trong $ENV_FILE}"
+    : "${CF_ZONE_ID:?Thiếu CF_ZONE_ID trong $ENV_FILE}"
+    : "${CF_DOMAIN:?Thiếu CF_DOMAIN trong $ENV_FILE}"
+}
 
 api() { # method path [json-body]
     local m=$1 p=$2 d=${3:-}
     if [ -n "$d" ]; then
-        curl -s -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" \
+        curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 60 --retry 2 \
+             -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" \
              -H "Content-Type: application/json" --data "$d" "$API$p"
     else
-        curl -s -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" "$API$p"
+        curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 60 --retry 2 \
+             -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" "$API$p"
     fi
 }
 
 check() { # kiểm tra .success, in lỗi nếu có
     local r=$1
-    if [ "$(jq -r '.success' <<<"$r")" != "true" ]; then
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$r"; then
         echo "$r" | jq -r '.errors[]? | "  [\(.code)] \(.message)"' >&2
         die "Cloudflare API từ chối yêu cầu."
     fi
@@ -53,8 +82,12 @@ tunnel_id() {
 
 cmd_init() {
     local name=${1:-} r id token
+    require_commands; load_config
     [ -n "$name" ] || die "Thiếu tên. Ví dụ: cf-tunnel init homelab"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "Tên tunnel không hợp lệ."
     [ -f "$STATE" ] && die "Đã có tunnel id $(cat $STATE). Xoá $STATE nếu muốn tạo mới."
+    command -v cloudflared >/dev/null 2>&1 || die "Thiếu dependency: cloudflared"
+    install -d -m 700 "$(dirname "$STATE")"
 
     echo "Đang tạo tunnel '$name' ..."
     r=$(api POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
@@ -84,8 +117,11 @@ cmd_init() {
 
 cmd_add() {
     local host=${1:-} svc=${2:-} id cur new r rec_id
+    require_commands; load_config
     [ -n "$host" ] && [ -n "$svc" ] || \
         die "Cú pháp: cf-tunnel add <hostname> <service>\n  VD: cf-tunnel add app.$CF_DOMAIN http://localhost:8080"
+    valid_hostname "$host" || die "Hostname không hợp lệ: $host"
+    valid_service "$svc" || die "Service URL không hợp lệ: $svc"
     id=$(tunnel_id)
 
     # --- cập nhật luật ingress ---
@@ -104,7 +140,7 @@ cmd_add() {
     # --- bản ghi DNS CNAME (tạo mới hoặc cập nhật) ---
     local body; body=$(jq -nc --arg n "$host" --arg c "$id.cfargotunnel.com" \
         '{type:"CNAME", name:$n, content:$c, proxied:true, ttl:1}')
-    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?name=$host" | jq -r '.result[0].id // empty')
+    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$host" | jq -r '.result[0].id // empty')
     if [ -n "$rec_id" ]; then
         r=$(api PUT "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$body"); check "$r"
         ok "DNS: đã cập nhật CNAME $host"
@@ -118,7 +154,9 @@ cmd_add() {
 
 cmd_rm() {
     local host=${1:-} id cur new r rec_id
+    require_commands; load_config
     [ -n "$host" ] || die "Cú pháp: cf-tunnel rm <hostname>"
+    valid_hostname "$host" || die "Hostname không hợp lệ: $host"
     id=$(tunnel_id)
     r=$(api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations"); check "$r"
     cur=$(jq '.result.config' <<<"$r")
@@ -131,14 +169,16 @@ cmd_rm() {
         "$(jq -nc --argjson c "$new" '{config:$c}')"); check "$r"
     ok "Đã gỡ ingress cho $host"
 
-    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?name=$host" | jq -r '.result[0].id // empty')
+    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$host" | \
+        jq -r --arg target "$id.cfargotunnel.com" 'first(.result[] | select(.content == $target) | .id) // empty')
     if [ -n "$rec_id" ]; then
-        api DELETE "/zones/$CF_ZONE_ID/dns_records/$rec_id" >/dev/null
+        r=$(api DELETE "/zones/$CF_ZONE_ID/dns_records/$rec_id"); check "$r"
         ok "Đã xoá bản ghi DNS $host"
     fi
 }
 
 cmd_ls() {
+    require_commands; load_config
     local id; id=$(tunnel_id)
     echo "Tunnel id: $id"
     api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" \
@@ -148,17 +188,23 @@ cmd_ls() {
 }
 
 cmd_status() {
+    require_commands; load_config
     local id; id=$(tunnel_id)
     echo "--- Tunnel ---"
     api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
         | jq -r '.result | "  Tên:        \(.name)\n  ID:         \(.id)\n  Trạng thái: \(.status)\n  Kết nối:    \(.conns_active_at // "chưa kết nối")"'
     echo "--- Dịch vụ hệ thống ---"
-    systemctl status cloudflared --no-pager -n 8 2>/dev/null | sed 's/^/  /'
+    systemctl status cloudflared --no-pager -n 8 2>/dev/null | sed 's/^/  /' || true
 }
 
 cmd_tunnels() {
+    require_commands; load_config
     api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false" \
         | jq -r '.result[] | "  [\(.status)]\t\(.name)\t\(.id)"'
+}
+
+cmd_version() {
+    echo "cf-tunnel $VERSION"
 }
 
 case "${1:-}" in
@@ -168,5 +214,6 @@ case "${1:-}" in
     ls)      shift; cmd_ls ;;
     status)  shift; cmd_status ;;
     tunnels) shift; cmd_tunnels ;;
+    version|-v|--version) cmd_version ;;
     *) sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
