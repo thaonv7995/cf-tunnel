@@ -1,0 +1,172 @@
+#!/bin/bash
+# ------------------------------------------------------------
+#  cf-tunnel — quản lý Cloudflare Tunnel cho server này
+#
+#  cf-tunnel init <ten-tunnel>          Tạo tunnel + cài dịch vụ (chạy 1 lần)
+#  cf-tunnel add  <hostname> <dich-vu>  Trỏ 1 tên miền vào 1 service nội bộ
+#  cf-tunnel rm   <hostname>            Gỡ 1 tên miền
+#  cf-tunnel ls                         Xem các route hiện có
+#  cf-tunnel status                     Trạng thái tunnel + dịch vụ
+#  cf-tunnel tunnels                    Liệt kê mọi tunnel trong account
+#
+#  Ví dụ:
+#    sudo cf-tunnel init homelab
+#    sudo cf-tunnel add app.thaonv.online http://localhost:8080
+#    sudo cf-tunnel add nas.thaonv.online http://127.0.0.1:9000
+# ------------------------------------------------------------
+set -uo pipefail
+
+ENV_FILE=/etc/cloudflared/cf-api.env
+STATE=/etc/cloudflared/tunnel-id
+API=https://api.cloudflare.com/client/v4
+
+[ "$(id -u)" -eq 0 ] || { echo "Cần chạy bằng sudo."; exit 1; }
+[ -r "$ENV_FILE" ] || { echo "Không tìm thấy $ENV_FILE"; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+die() { printf '\033[1;31mLỗi:\033[0m %s\n' "$*" >&2; exit 1; }
+ok()  { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+
+api() { # method path [json-body]
+    local m=$1 p=$2 d=${3:-}
+    if [ -n "$d" ]; then
+        curl -s -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" \
+             -H "Content-Type: application/json" --data "$d" "$API$p"
+    else
+        curl -s -X "$m" -H "Authorization: Bearer $CF_API_TOKEN" "$API$p"
+    fi
+}
+
+check() { # kiểm tra .success, in lỗi nếu có
+    local r=$1
+    if [ "$(jq -r '.success' <<<"$r")" != "true" ]; then
+        echo "$r" | jq -r '.errors[]? | "  [\(.code)] \(.message)"' >&2
+        die "Cloudflare API từ chối yêu cầu."
+    fi
+}
+
+tunnel_id() {
+    [ -f "$STATE" ] || die "Chưa có tunnel. Chạy: sudo cf-tunnel init <ten>"
+    cat "$STATE"
+}
+
+cmd_init() {
+    local name=${1:-} r id token
+    [ -n "$name" ] || die "Thiếu tên. Ví dụ: cf-tunnel init homelab"
+    [ -f "$STATE" ] && die "Đã có tunnel id $(cat $STATE). Xoá $STATE nếu muốn tạo mới."
+
+    echo "Đang tạo tunnel '$name' ..."
+    r=$(api POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
+        "$(jq -nc --arg n "$name" '{name:$n, config_src:"cloudflare"}')")
+    check "$r"
+    id=$(jq -r '.result.id'    <<<"$r")
+    token=$(jq -r '.result.token' <<<"$r")
+    echo "$id" > "$STATE"; chmod 600 "$STATE"
+    ok "Tunnel đã tạo: $name ($id)"
+
+    # Cấu hình rỗng, chỉ có luật bắt-tất-cả trả 404
+    r=$(api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" \
+        '{"config":{"ingress":[{"service":"http_status:404"}]}}')
+    check "$r"
+
+    echo "Đang cài dịch vụ hệ thống cloudflared ..."
+    systemctl stop cloudflared 2>/dev/null
+    cloudflared service uninstall 2>/dev/null
+    cloudflared service install "$token" || die "Cài dịch vụ thất bại"
+    systemctl enable --now cloudflared
+    sleep 3
+    systemctl is-active cloudflared && ok "cloudflared đang chạy"
+    echo
+    echo "Tiếp theo, trỏ tên miền vào service nội bộ:"
+    echo "  sudo cf-tunnel add app.$CF_DOMAIN http://localhost:8080"
+}
+
+cmd_add() {
+    local host=${1:-} svc=${2:-} id cur new r rec_id
+    [ -n "$host" ] && [ -n "$svc" ] || \
+        die "Cú pháp: cf-tunnel add <hostname> <service>\n  VD: cf-tunnel add app.$CF_DOMAIN http://localhost:8080"
+    id=$(tunnel_id)
+
+    # --- cập nhật luật ingress ---
+    r=$(api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations"); check "$r"
+    cur=$(jq '.result.config // {ingress:[]}' <<<"$r")
+    new=$(jq --arg h "$host" --arg s "$svc" '
+        .ingress = ( [ (.ingress // [])[]
+                       | select(.hostname != $h)
+                       | select(.service  != "http_status:404") ]
+                     + [{hostname:$h, service:$s}]
+                     + [{service:"http_status:404"}] )' <<<"$cur")
+    r=$(api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" \
+        "$(jq -nc --argjson c "$new" '{config:$c}')"); check "$r"
+    ok "Ingress: $host → $svc"
+
+    # --- bản ghi DNS CNAME (tạo mới hoặc cập nhật) ---
+    local body; body=$(jq -nc --arg n "$host" --arg c "$id.cfargotunnel.com" \
+        '{type:"CNAME", name:$n, content:$c, proxied:true, ttl:1}')
+    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?name=$host" | jq -r '.result[0].id // empty')
+    if [ -n "$rec_id" ]; then
+        r=$(api PUT "/zones/$CF_ZONE_ID/dns_records/$rec_id" "$body"); check "$r"
+        ok "DNS: đã cập nhật CNAME $host"
+    else
+        r=$(api POST "/zones/$CF_ZONE_ID/dns_records" "$body"); check "$r"
+        ok "DNS: đã tạo CNAME $host → $id.cfargotunnel.com (proxied)"
+    fi
+    echo
+    echo "Xong. Thử: https://$host"
+}
+
+cmd_rm() {
+    local host=${1:-} id cur new r rec_id
+    [ -n "$host" ] || die "Cú pháp: cf-tunnel rm <hostname>"
+    id=$(tunnel_id)
+    r=$(api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations"); check "$r"
+    cur=$(jq '.result.config' <<<"$r")
+    new=$(jq --arg h "$host" '
+        .ingress = ( [ (.ingress // [])[]
+                       | select(.hostname != $h)
+                       | select(.service  != "http_status:404") ]
+                     + [{service:"http_status:404"}] )' <<<"$cur")
+    r=$(api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" \
+        "$(jq -nc --argjson c "$new" '{config:$c}')"); check "$r"
+    ok "Đã gỡ ingress cho $host"
+
+    rec_id=$(api GET "/zones/$CF_ZONE_ID/dns_records?name=$host" | jq -r '.result[0].id // empty')
+    if [ -n "$rec_id" ]; then
+        api DELETE "/zones/$CF_ZONE_ID/dns_records/$rec_id" >/dev/null
+        ok "Đã xoá bản ghi DNS $host"
+    fi
+}
+
+cmd_ls() {
+    local id; id=$(tunnel_id)
+    echo "Tunnel id: $id"
+    api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" \
+        | jq -r '.result.config.ingress[]? |
+                 if .hostname then "  \(.hostname)  →  \(.service)"
+                 else "  (mặc định)      →  \(.service)" end'
+}
+
+cmd_status() {
+    local id; id=$(tunnel_id)
+    echo "--- Tunnel ---"
+    api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
+        | jq -r '.result | "  Tên:        \(.name)\n  ID:         \(.id)\n  Trạng thái: \(.status)\n  Kết nối:    \(.conns_active_at // "chưa kết nối")"'
+    echo "--- Dịch vụ hệ thống ---"
+    systemctl status cloudflared --no-pager -n 8 2>/dev/null | sed 's/^/  /'
+}
+
+cmd_tunnels() {
+    api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false" \
+        | jq -r '.result[] | "  [\(.status)]\t\(.name)\t\(.id)"'
+}
+
+case "${1:-}" in
+    init)    shift; cmd_init "$@" ;;
+    add)     shift; cmd_add "$@" ;;
+    rm)      shift; cmd_rm "$@" ;;
+    ls)      shift; cmd_ls ;;
+    status)  shift; cmd_status ;;
+    tunnels) shift; cmd_tunnels ;;
+    *) sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
